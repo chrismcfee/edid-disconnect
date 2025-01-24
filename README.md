@@ -1,0 +1,2 @@
+# edid-disconnect
+ dc
