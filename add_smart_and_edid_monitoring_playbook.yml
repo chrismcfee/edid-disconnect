@@ -1,0 +1,175 @@
+- hosts: all
+  become: yes
+  vars:
+    prometheus_textfile_dir: "/var/lib/node_exporter/textfile"
+    prometheus_port: 9111
+    smartmonitor_script: "/usr/local/bin/smart_status.sh"
+    checkalledid_script: "/usr/local/bin/checkalledid.sh"
+    edid_python_script: "/usr/local/bin/edid.py"
+    monitor_displays_script: "/usr/local/bin/monitor-displays.sh"
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - smartmontools
+          - prometheus-node-exporter
+          - i2c-tools
+          - python3
+          - python3-pip
+        state: present
+        update_cache: no
+
+    - name: Install Prometheus Python client
+      pip:
+        name: prometheus_client
+        executable: pip3
+
+    - name: Create Prometheus textfile collector directory
+      file:
+        path: "{{ prometheus_textfile_dir }}"
+        state: directory
+        owner: node_exporter
+        group: node_exporter
+        mode: 0755
+
+    - name: Deploy SMART status collection script
+      copy:
+        dest: "{{ smartmonitor_script }}"
+        content: |
+          #!/bin/bash
+          # Collects SMART status for all disks
+          METRIC_FILE="{{ prometheus_textfile_dir }}/smart_status.prom"
+          {
+            echo "# HELP smart_status SMART overall health status (1=PASSED, 0=FAILED)"
+            echo "# TYPE smart_status gauge"
+
+            for disk in /dev/sd?; do
+              if smartctl -H "$disk" &>/dev/null; then
+                status=$(smartctl -H "$disk" | grep "SMART overall-health" | grep -q PASSED && echo 1 || echo 0)
+                echo "smart_status{disk=\"$disk\"} $status"
+              fi
+            done
+          } > "$METRIC_FILE"
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: Deploy EDID status check script (checkalledid.sh)
+      copy:
+        dest: "{{ checkalledid_script }}"
+        content: |
+          #!/bin/bash
+          # Check EDID status over I2C
+          for bus in {1..8}; do
+              echo "Testing bus $bus"
+              if i2cdump -y $bus 0x50 2>/dev/null | grep -qv "XX XX XX XX"; then
+                  echo "Found EDID data on bus $bus"
+                  i2cdump -y $bus 0x50
+              fi
+          done
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: Deploy EDID Python metrics exporter (edid.py)
+      copy:
+        dest: "{{ edid_python_script }}"
+        content: |
+          from prometheus_client import start_http_server, Gauge
+          import subprocess
+          import time
+
+          edid_status = Gauge('edid_connection_status', 'EDID connection status')
+
+          def check_edid():
+              try:
+                  # Replace this with appropriate command for your system
+                  result = subprocess.run(['i2cdetect', '-y', '1'], capture_output=True, text=True)
+                  if "50" in result.stdout: # EDID is usually at address 0x50
+                      return 1
+                  return 0
+              except:
+                  return 0
+
+          if __name__ == '__main__':
+              start_http_server(9111)  # Prometheus HTTP server port
+              while True:
+                  edid_status.set(check_edid())
+                  time.sleep(10)
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: Deploy display monitor connection status script (monitor-displays.sh)
+      copy:
+        dest: "{{ monitor_displays_script }}"
+        content: |
+          #!/bin/bash
+          # Checks connected displays and outputs to Prometheus metrics
+          METRIC_FILE="{{ prometheus_textfile_dir }}/display_status.prom"
+
+          {
+              echo "# HELP display_status Display connection status (1=connected, 0=disconnected)"
+              echo "# TYPE display_status gauge"
+
+              # Iterate over available xrandr outputs
+              for output in $(xrandr --listmonitors | grep -oP '^\s+\K(\S+)'); do
+                  status=$(xrandr --listmonitors | grep -q "$output" && echo 1 || echo 0)
+                  echo "display_status{output=\"$output\"} $status"
+              done
+
+              echo "# HELP total_enabled_displays Total number of enabled displays"
+              echo "# TYPE total_enabled_displays gauge"
+              total=$(xrandr --listmonitors | grep -c " connected ")
+              echo "total_enabled_displays $total"
+          } > "$METRIC_FILE"
+        owner: root
+        group: root
+        mode: 0755
+
+    - name: Ensure scripts are executable
+      file:
+        path: "{{ item }}"
+        mode: '0755'
+        state: file
+      loop:
+        - "{{ smartmonitor_script }}"
+        - "{{ checkalledid_script }}"
+        - "{{ edid_python_script }}"
+        - "{{ monitor_displays_script }}"
+
+    - name: Configure cron jobs for metrics collection
+      cron:
+        name: "Run SMART and display monitor scripts"
+        job: "{{ item }}"
+        state: present
+      with_items:
+        - "* * * * * {{ smartmonitor_script }}"
+        - "* * * * * {{ monitor_displays_script }}"
+      cron_file: "smart_display_cron"
+
+    - name: Ensure edid.py is started at boot
+      copy:
+        dest: /etc/systemd/system/edid_exporter.service
+        content: |
+          [Unit]
+          Description=EDID Prometheus Metrics Exporter
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/bin/python3 {{ edid_python_script }}
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: 0644
+
+    - name: Reload systemd and enable edid_exporter
+      systemd:
+        daemon_reload: yes
+        name: edid_exporter
+        enabled: yes
+        state: restarted
